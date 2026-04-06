@@ -3,6 +3,7 @@ import sys
 import argparse
 import fnmatch
 import pyperclip
+import json # Thêm thư viện xử lý ipynb
 
 # --- CÁC THƯ VIỆN XỬ LÝ TÀI LIỆU ---
 try:
@@ -34,9 +35,7 @@ def read_pdf(file_path):
     doc = fitz.open(file_path)
     content = []
     for page in doc:
-        # Lấy các block nội dung (văn bản và hình ảnh)
         blocks = page.get_text("blocks")
-        # Sắp xếp từ trên xuống dưới (y0), từ trái qua phải (x0)
         blocks.sort(key=lambda b: (b[1], b[0]))
         for b in blocks:
             block_type = b[6]
@@ -52,22 +51,20 @@ def read_docx(file_path):
     doc = docx.Document(file_path)
     content = []
     
-    # Duyệt qua các thành phần XML cốt lõi để giữ đúng thứ tự bảng/văn bản
     for block in doc.element.body:
-        if block.tag.endswith('p'): # Paragraph
+        if block.tag.endswith('p'): 
             p = docx.text.paragraph.Paragraph(block, doc)
-            # Kiểm tra xem có chứa hình ảnh không (thông qua thẻ w:drawing hoặc pic:pic)
             if 'w:drawing' in block.xml or 'pic:pic' in block.xml:
                 content.append("[IMAGE PLACEHOLDER]")
             if p.text.strip():
                 content.append(p.text.strip())
                 
-        elif block.tag.endswith('tbl'): # Table
+        elif block.tag.endswith('tbl'):
             t = docx.table.Table(block, doc)
             for row in t.rows:
                 row_data = [cell.text.replace('\n', ' ').strip() for cell in row.cells]
                 content.append("| " + " | ".join(row_data) + " |")
-            content.append("") # Dòng trống sau bảng
+            content.append("")
             
     return "\n".join(content)
 
@@ -80,17 +77,11 @@ def read_excel(file_path):
         sheet = wb[sheet_name]
         content.append(f"### Sheet: {sheet_name}")
         for row in sheet.iter_rows(values_only=True):
-            # Bỏ qua các dòng hoàn toàn rỗng (tất cả các ô đều là None hoặc chuỗi trống)
             if not any(cell is not None and str(cell).strip() != "" for cell in row):
                 continue
-                
             row_data = [str(cell) if cell is not None else "" for cell in row]
-            
-            # Xóa các ô rỗng thừa ở cuối mỗi dòng để giảm dung lượng chuỗi
             while row_data and row_data[-1].strip() == "":
                 row_data.pop()
-                
-            # Tạo bảng markdown cơ bản
             content.append("| " + " | ".join(row_data) + " |")
         content.append("\n")
     return "\n".join(content)
@@ -104,23 +95,83 @@ def read_pptx(file_path):
         content.append(f"### Slide {i+1}")
         shapes_data = []
         for shape in slide.shapes:
-            # Lấy vị trí để sắp xếp (ưu tiên các shape không có vị trí rõ ràng lên trước hoặc bỏ qua)
             top = shape.top if hasattr(shape, "top") and shape.top is not None else 0
             left = shape.left if hasattr(shape, "left") and shape.left is not None else 0
             
             if hasattr(shape, "text_frame") and shape.text_frame:
                 shapes_data.append((top, left, "text", shape.text))
-            elif hasattr(shape, "image") or shape.shape_type == 13: # 13 là msoPICTURE
+            elif hasattr(shape, "image") or shape.shape_type == 13: 
                 shapes_data.append((top, left, "image", "[IMAGE PLACEHOLDER]"))
                 
-        # Sắp xếp: từ trên xuống dưới, từ trái qua phải
         shapes_data.sort(key=lambda x: (x[0], x[1]))
-        
         for s in shapes_data:
             if s[3].strip():
                 content.append(s[3].strip())
         content.append("\n")
     return "\n".join(content)
+
+def read_ipynb(file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            nb = json.load(f)
+    except Exception as e:
+        return f"[LỖI] Không thể đọc file ipynb: {e}"
+
+    content = []
+    for cell in nb.get('cells', []):
+        cell_type = cell.get('cell_type', '')
+        source = "".join(cell.get('source', []))
+
+        if cell_type == 'markdown':
+            content.append(source.strip())
+            if 'attachments' in cell:
+                content.append("[IMAGE PLACEHOLDER]")
+                
+        elif cell_type == 'code':
+            if source.strip():
+                content.append(f"```python\n{source}\n```")
+            for output in cell.get('outputs', []):
+                output_type = output.get('output_type', '')
+                if output_type in ('display_data', 'execute_result'):
+                    data = output.get('data', {})
+                    if any(k.startswith('image/') for k in data.keys()):
+                        content.append("[IMAGE PLACEHOLDER]")
+                    elif 'text/plain' in data:
+                        content.append("".join(data['text/plain']).strip())
+                elif output_type == 'stream':
+                    content.append("".join(output.get('text', [])).strip())
+                    
+    return "\n\n".join(content)
+
+# --- HELPER: GIỚI HẠN SỐ DÒNG THEO FILTER ---
+def apply_line_limit(content, rel_path, limit_args):
+    if not limit_args:
+        return content
+        
+    unix_path = rel_path.replace(os.sep, '/')
+    basename = os.path.basename(unix_path)
+    
+    for pattern, max_lines_str in limit_args:
+        if not max_lines_str.isdigit():
+            continue
+        max_lines = int(max_lines_str)
+        
+        # Logic match giống gitignore
+        is_match = False
+        if pattern.startswith('/'):
+            if fnmatch.fnmatch(unix_path, pattern.lstrip('/')): is_match = True
+        elif '/' not in pattern:
+            if fnmatch.fnmatch(basename, pattern): is_match = True
+        else:
+            if fnmatch.fnmatch(unix_path, pattern) or fnmatch.fnmatch(unix_path, f"*/{pattern}"): is_match = True
+            
+        if is_match:
+            lines = content.split('\n')
+            if len(lines) > max_lines:
+                return '\n'.join(lines[:max_lines]) + f"\n\n[... ĐÃ CẮT BỚT. CHỈ HIỂN THỊ {max_lines} DÒNG ĐẦU ...]"
+            break # Áp dụng limit đầu tiên match được
+            
+    return content
 
 
 # --- HÀM CHÍNH ---
@@ -133,6 +184,8 @@ def combine_files_to_clipboard(dir_path, ignore_patterns, args):
     print(f"Đang quét: {dir_path}")
     if ignore_patterns:
         print(f"Danh sách loại trừ (Gitignore style): {ignore_patterns}")
+    if args.limit:
+        print(f"Luật giới hạn số dòng: {args.limit}")
 
     def is_ignored(rel_path, is_dir):
         unix_path = rel_path.replace(os.sep, '/')
@@ -157,7 +210,6 @@ def combine_files_to_clipboard(dir_path, ignore_patterns, args):
             rel_root = os.path.relpath(root, dir_path)
             if rel_root == ".": rel_root = ""
 
-            # Lọc thư mục
             valid_dirs = []
             for d in dirs:
                 d_rel_path = os.path.join(rel_root, d)
@@ -165,7 +217,6 @@ def combine_files_to_clipboard(dir_path, ignore_patterns, args):
                     valid_dirs.append(d)
             dirs[:] = valid_dirs 
 
-            # Lọc file
             for filename in files:
                 f_rel_path = os.path.join(rel_root, filename)
                 if is_ignored(f_rel_path, is_dir=False):
@@ -177,23 +228,27 @@ def combine_files_to_clipboard(dir_path, ignore_patterns, args):
 
                 all_content.append(f"=== FILE: {display_path} ===\n")
                 
+                raw_content = ""
                 try:
-                    # Chặn logic đọc file theo extension
                     if ext == '.docx' and args.docx:
-                        all_content.append(read_docx(full_path))
+                        raw_content = read_docx(full_path)
                     elif ext == '.pdf' and args.pdf:
-                        all_content.append(read_pdf(full_path))
+                        raw_content = read_pdf(full_path)
                     elif ext in ['.xlsx', '.xls'] and args.excel:
-                        all_content.append(read_excel(full_path))
+                        raw_content = read_excel(full_path)
                     elif ext == '.pptx' and args.pptx:
-                        all_content.append(read_pptx(full_path))
+                        raw_content = read_pptx(full_path)
+                    elif ext == '.ipynb' and args.ipynb:
+                        raw_content = read_ipynb(full_path)
                     else:
-                        # Fallback về đọc file text tiêu chuẩn (code, txt, md...)
                         with open(full_path, 'r', encoding='utf-8') as infile:
-                            content = infile.read()
-                            all_content.append(content)
+                            raw_content = infile.read()
+                            
+                    # Cắt dòng nếu trúng luật -l
+                    final_content = apply_line_limit(raw_content, f_rel_path, args.limit)
+                    all_content.append(final_content)
+                    
                 except UnicodeDecodeError:
-                    # Bỏ qua nếu file là nhị phân mà không có cờ tương ứng
                     all_content.append("[WARNING] File nhị phân bị bỏ qua do không hỗ trợ hoặc không truyền cờ phù hợp.")
                 except Exception as e:
                     all_content.append(f"[LỖI XỬ LÝ] {str(e)}")
@@ -217,11 +272,14 @@ if __name__ == "__main__":
     parser.add_argument("folder", help="Thư mục cần quét")
     parser.add_argument("-e", "--exclude", nargs='*', default=[], help="Danh sách loại trừ (VD: __pycache__/ *.pyc node_modules/ .env)")
     
-    # Sử dụng action="store_true" cho phép gom cờ lại với nhau (VD: -dpxt)
+    # Action 'append' + nargs=2 để nhập nhiều điều kiện (VD: -l *.csv 100 -l src/*.js 500)
+    parser.add_argument("-l", "--limit", action="append", nargs=2, metavar=('PATTERN', 'LINES'), help="Giới hạn dòng (VD: -l *.csv 100)")
+    
     parser.add_argument("-d", "--docx", action="store_true", help="Bật quét nội dung file .docx")
     parser.add_argument("-p", "--pdf", action="store_true", help="Bật quét nội dung file .pdf")
     parser.add_argument("-x", "--excel", action="store_true", help="Bật quét nội dung file .xlsx")
     parser.add_argument("-t", "--pptx", action="store_true", help="Bật quét nội dung file .pptx")
+    parser.add_argument("-i", "--ipynb", action="store_true", help="Bật quét nội dung file .ipynb")
     
     args = parser.parse_args()
     combine_files_to_clipboard(args.folder, args.exclude, args)
