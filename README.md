@@ -75,7 +75,7 @@ python main.py ./data_folder -e __pycache__/ *.pyc -dpxt
 
 ## 📦 Standalone Executable (Release)
 
-If you don't want to install Python or dependencies, you can download the standalone executable (an `.exe` file for Windows or a binary for macOS/Linux) from the **[Releases](https://www.google.com/search?q=../../releases)** page.
+If you don't want to install Python or dependencies, you can download the standalone executable (an `.exe` file for Windows or a binary for macOS/Linux) from the **[Releases](https://github.com/nguyenduc13475/Folder2Clipboard/releases/tag/v1.0.0)** page.
 
 How to run the standalone build via Terminal:
 
