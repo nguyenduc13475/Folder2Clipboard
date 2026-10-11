@@ -85,30 +85,115 @@ def read_excel(file_path):
             content.append("| " + " | ".join(row_data) + " |")
         content.append("\n")
     return "\n".join(content)
+# --- BỔ SUNG & THAY THẾ CHO PPTX ĐỂ ĐẠT ĐỘ CHI TIẾT CAO NHẤT ---
+
+def _format_cell_text(text):
+    """Làm sạch ký tự xuống dòng và ký tự pipe | trong bảng để không vỡ bảng Markdown."""
+    clean = text.replace('\r\n', ' ').replace('\n', ' ').replace('|', r'\|').strip()
+    return clean if clean else " "
+
+def _extract_shape_data(shape, top_offset=0, left_offset=0):
+    """
+    Hàm đệ quy để duyệt sâu mọi shape:
+    - Bắt trọn Text box, Group Shape, Table, Chart, Image, SmartArt.
+    - Giữ lại tọa độ để sắp xếp thứ tự đọc từ trên xuống dưới, từ trái qua phải.
+    """
+    items = []
+    
+    top = getattr(shape, "top", 0) or 0
+    left = getattr(shape, "left", 0) or 0
+    actual_top = top_offset + top
+    actual_left = left_offset + left
+
+    # 1. NHÓM HÌNH (GROUP SHAPE) -> Đệ quy duyệt sâu vào các shape con
+    if shape.shape_type == 6 or hasattr(shape, "shapes"):  # 6 là MSO_SHAPE_TYPE.GROUP
+        for child in shape.shapes:
+            items.extend(_extract_shape_data(child, top_offset=actual_top, left_offset=actual_left))
+        return items
+
+    # 2. BẢNG BIỂU (TABLE) -> Render dạng Markdown Table đầy đủ
+    if shape.has_table:
+        table = shape.table
+        rows_md = []
+        col_count = len(table.columns)
+        for r_idx, row in enumerate(table.rows):
+            row_cells = [_format_cell_text(cell.text) for cell in row.cells]
+            rows_md.append("| " + " | ".join(row_cells) + " |")
+            if r_idx == 0:  # Đường vạch ngăn header
+                rows_md.append("| " + " | ".join(["---"] * col_count) + " |")
+        table_text = "\n".join(rows_md)
+        items.append((actual_top, actual_left, "table", f"\n[BẢNG DỮ LIỆU]:\n{table_text}\n"))
+        return items
+
+    # 3. BIỂU ĐỒ (CHART)
+    if shape.has_chart:
+        chart_title = shape.chart.chart_title.text_frame.text if shape.chart.has_title else "Không có tiêu đề"
+        items.append((actual_top, actual_left, "chart", f"[BIỂU ĐỒ: {chart_title}]"))
+        return items
+
+    # 4. HÌNH ẢNH (PICTURE)
+    if hasattr(shape, "image") or shape.shape_type == 13:  # 13 là MSO_SHAPE_TYPE.PICTURE
+        desc = f"[IMAGE PLACEHOLDER (Vị trí: x={actual_left // 914400}in, y={actual_top // 914400}in)]"
+        items.append((actual_top, actual_left, "image", desc))
+        return items
+
+    # 5. VĂN BẢN (TEXT BOX / SHAPE CHỨA TEXT) -> Giữ nguyên Bullet & Cấp độ thụt dòng
+    if hasattr(shape, "text_frame") and shape.text_frame:
+        lines = []
+        for p in shape.text_frame.paragraphs:
+            p_text = p.text.strip()
+            if not p_text:
+                continue
+            indent = "  " * getattr(p, "level", 0)  # Thụt lề theo cấp độ bullet
+            lines.append(f"{indent}- {p_text}")
+        if lines:
+            items.append((actual_top, actual_left, "text", "\n".join(lines)))
+
+    return items
+
 
 def read_pptx(file_path):
     if not Presentation:
         return "[LỖI] Thiếu thư viện python-pptx. Hãy chạy: pip install python-pptx"
-    prs = Presentation(file_path)
+    
+    try:
+        prs = Presentation(file_path)
+    except Exception as e:
+        return f"[LỖI] Không thể đọc file pptx: {e}"
+
     content = []
+    
     for i, slide in enumerate(prs.slides):
-        content.append(f"### Slide {i+1}")
+        slide_lines = []
+        slide_title = f"### Slide {i+1}"
+        
+        # Nhận diện Title chính thức nếu có để đặt tên Slide rõ ràng
+        if slide.shapes.title and slide.shapes.title.text.strip():
+            slide_title += f": {slide.shapes.title.text.strip()}"
+        slide_lines.append(slide_title)
+
+        # Duyệt tất cả shapes (bao gồm đệ quy group shapes, table, v.v.)
         shapes_data = []
         for shape in slide.shapes:
-            top = shape.top if hasattr(shape, "top") and shape.top is not None else 0
-            left = shape.left if hasattr(shape, "left") and shape.left is not None else 0
-            
-            if hasattr(shape, "text_frame") and shape.text_frame:
-                shapes_data.append((top, left, "text", shape.text))
-            elif hasattr(shape, "image") or shape.shape_type == 13: 
-                shapes_data.append((top, left, "image", "[IMAGE PLACEHOLDER]"))
-                
+            shapes_data.extend(_extract_shape_data(shape))
+
+        # Sắp xếp theo thứ tự đọc tự nhiên: từ trên xuống dưới, từ trái sang phải
         shapes_data.sort(key=lambda x: (x[0], x[1]))
-        for s in shapes_data:
-            if s[3].strip():
-                content.append(s[3].strip())
-        content.append("\n")
-    return "\n".join(content)
+
+        for item in shapes_data:
+            text = item[3].strip()
+            if text:
+                slide_lines.append(text)
+
+        # Trích xuất Speaker Notes (Ghi chú diễn giả ở chân slide)
+        if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+            notes = slide.notes_slide.notes_text_frame.text.strip()
+            if notes:
+                slide_lines.append(f"\n> 📝 **Speaker Notes:**\n> " + notes.replace("\n", "\n> "))
+
+        content.append("\n".join(slide_lines))
+
+    return "\n\n---\n\n".join(content)
 
 def read_ipynb(file_path):
     try:
